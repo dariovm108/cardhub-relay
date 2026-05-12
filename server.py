@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
 """
-CardHub Relay Server
-Servidor WebSocket que hace de puente entre todos los jugadores.
-Cada sala es independiente. El host crea la sala con un código,
-los clientes se unen con ese mismo código.
+CardHub Relay v5
+Protocolo:
+  Cliente manda {"ctrl":"create"} -> recibe {"ctrl":"created","code":"ABCDEF"}
+  Cliente manda {"ctrl":"join","code":"ABCDEF"} -> recibe {"ctrl":"joined","peer_id":N}
+  Luego {"ctrl":"peer_connected","peer_id":N} al host cuando alguien entra
+  Luego {"ctrl":"peer_disconnected","peer_id":N} al host cuando alguien sale
+  {"ctrl":"host_disconnected"} a los clientes cuando el host se va
+
+  Mensajes de juego (sin campo "ctrl"):
+  {"method":"...","args":[...],"to":-1|1|N,"sender":ID}
+  to=-1 -> broadcast a todos menos el remitente
+  to=1  -> al host
+  to=N  -> al peer N
+  El relay añade "sender" antes de reenviar.
 """
 
 import asyncio
@@ -12,138 +22,128 @@ import os
 import random
 import string
 import websockets
-from websockets.server import WebSocketServerProtocol
 
-# sala_code -> {"host": ws, "clients": [ws, ...], "all": [ws, ...]}
-rooms: dict = {}
-# ws -> sala_code
-ws_to_room: dict = {}
+rooms = {}   # code -> {"host":ws, "clients":{peer_id:ws}, "next_id":int}
+conns = {}   # ws -> {"code":str, "peer_id":int}
 
 
-def generate_code() -> str:
-    """Genera un código de sala de 6 letras mayúsculas."""
+def make_code():
     while True:
-        code = "".join(random.choices(string.ascii_uppercase, k=6))
-        if code not in rooms:
-            return code
+        c = "".join(random.choices(string.ascii_uppercase, k=6))
+        if c not in rooms:
+            return c
 
 
-async def send_json(ws: WebSocketServerProtocol, data: dict) -> None:
+async def tx(ws, data):
     try:
-        await ws.send(json.dumps(data))
+        await ws.send(json.dumps(data) if isinstance(data, dict) else data)
     except Exception:
         pass
 
 
-async def broadcast_room(code: str, data: dict, exclude=None) -> None:
-    """Envía un mensaje a todos los miembros de una sala."""
-    if code not in rooms:
-        return
-    for ws in list(rooms[code]["all"]):
-        if ws is exclude:
-            continue
-        await send_json(ws, data)
-
-
-async def handle_client(ws: WebSocketServerProtocol) -> None:
-    print(f"[+] Conexión nueva: {ws.remote_address}")
+async def handler(ws):
+    print(f"[+] {ws.remote_address}")
     try:
         async for raw in ws:
             try:
                 msg = json.loads(raw)
-            except json.JSONDecodeError:
-                await send_json(ws, {"type": "error", "msg": "JSON inválido"})
+            except Exception:
+                await tx(ws, {"ctrl": "error", "msg": "JSON inválido"})
                 continue
 
-            t = msg.get("type", "")
+            ctrl = msg.get("ctrl", "")
 
-            # ── CREATE ──────────────────────────────────────────────
-            if t == "create":
-                if ws in ws_to_room:
-                    await send_json(ws, {"type": "error", "msg": "Ya estás en una sala"})
+            # ── Mensajes de control ─────────────────────────────────────────
+            if ctrl == "create":
+                if ws in conns:
+                    await tx(ws, {"ctrl": "error", "msg": "Ya estás en una sala"})
                     continue
-                code = generate_code()
-                rooms[code] = {"host": ws, "clients": [], "all": [ws]}
-                ws_to_room[ws] = code
-                await send_json(ws, {"type": "created", "code": code})
-                print(f"[Sala {code}] Creada por {ws.remote_address}")
+                code = make_code()
+                rooms[code] = {"host": ws, "clients": {}, "next_id": 2}
+                conns[ws] = {"code": code, "peer_id": 1}
+                await tx(ws, {"ctrl": "created", "code": code})
+                print(f"[{code}] Sala creada")
 
-            # ── JOIN ─────────────────────────────────────────────────
-            elif t == "join":
+            elif ctrl == "join":
                 code = str(msg.get("code", "")).upper().strip()
                 if code not in rooms:
-                    await send_json(ws, {"type": "error", "msg": "Sala no encontrada"})
+                    await tx(ws, {"ctrl": "error", "msg": f"Sala '{code}' no encontrada"})
                     continue
-                if ws in ws_to_room:
-                    await send_json(ws, {"type": "error", "msg": "Ya estás en una sala"})
+                if ws in conns:
+                    await tx(ws, {"ctrl": "error", "msg": "Ya estás en una sala"})
                     continue
-                rooms[code]["clients"].append(ws)
-                rooms[code]["all"].append(ws)
-                ws_to_room[ws] = code
-                # Asignar ID único dentro de la sala (2, 3, 4...)
-                client_id = len(rooms[code]["all"])  # host=1, resto 2+
-                await send_json(ws, {"type": "joined", "code": code, "id": client_id})
-                # Avisar al host de que llegó alguien
-                await send_json(rooms[code]["host"], {"type": "peer_joined", "id": client_id})
-                print(f"[Sala {code}] Cliente {client_id} unido ({ws.remote_address})")
+                room = rooms[code]
+                pid = room["next_id"]
+                room["next_id"] += 1
+                room["clients"][pid] = ws
+                conns[ws] = {"code": code, "peer_id": pid}
+                await tx(ws, {"ctrl": "joined", "peer_id": pid, "code": code})
+                await tx(room["host"], {"ctrl": "peer_connected", "peer_id": pid})
+                print(f"[{code}] Cliente {pid} unido")
 
-            # ── RELAY ────────────────────────────────────────────────
-            # Todos los mensajes de juego se envían como {"type":"relay","to":"all"|id,"data":{...}}
-            elif t == "relay":
-                code = ws_to_room.get(ws)
-                if not code:
+            # ── Mensajes de juego ───────────────────────────────────────────
+            elif "method" in msg:
+                info = conns.get(ws)
+                if not info:
                     continue
-                to = msg.get("to", "all")
-                data = msg.get("data", {})
-                wrapped = {"type": "relay", "data": data}
+                code = info["code"]
+                room = rooms.get(code)
+                if not room:
+                    continue
+                sender_id = info["peer_id"]
+                to = msg.get("to", -1)
+                msg["sender"] = sender_id  # añadir remitente
 
-                if to == "all":
-                    await broadcast_room(code, wrapped, exclude=ws)
-                elif to == "host":
-                    await send_json(rooms[code]["host"], wrapped)
+                if to == -1:
+                    # Broadcast a todos menos el remitente
+                    targets = []
+                    if room["host"] is not ws:
+                        targets.append(room["host"])
+                    for cws in room["clients"].values():
+                        if cws is not ws:
+                            targets.append(cws)
+                elif to == 1:
+                    targets = [room["host"]] if room["host"] is not ws else []
                 else:
-                    # to == peer id numérico
-                    target_id = int(to)
-                    all_ws = rooms[code]["all"]
-                    if 0 < target_id <= len(all_ws):
-                        await send_json(all_ws[target_id - 1], wrapped)
+                    cws = room["clients"].get(to)
+                    targets = [cws] if cws and cws is not ws else []
+
+                for t in targets:
+                    await tx(t, msg)
 
             else:
-                await send_json(ws, {"type": "error", "msg": f"Tipo desconocido: {t}"})
+                await tx(ws, {"ctrl": "error", "msg": f"Mensaje desconocido"})
 
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
-        # Limpiar sala si alguien se desconecta
-        code = ws_to_room.pop(ws, None)
-        if code and code in rooms:
-            rooms[code]["all"].remove(ws)
-            if ws in rooms[code]["clients"]:
-                rooms[code]["clients"].remove(ws)
-
-            if ws is rooms[code]["host"]:
-                # Host se fue: cerrar sala y echar a todos
-                print(f"[Sala {code}] Host desconectado, cerrando sala")
-                for member in list(rooms[code]["all"]):
-                    await send_json(member, {"type": "host_left"})
-                    ws_to_room.pop(member, None)
-                del rooms[code]
-            elif not rooms[code]["all"]:
-                del rooms[code]
-            else:
-                # Avisar al host de que alguien se fue
-                idx = len(rooms[code]["all"]) + 1  # aproximado
-                await send_json(rooms[code]["host"], {"type": "peer_left"})
-
-        print(f"[-] Desconectado: {ws.remote_address}")
+        info = conns.pop(ws, None)
+        if not info:
+            print(f"[-] {ws.remote_address} (sin sala)")
+            return
+        code = info["code"]
+        pid = info["peer_id"]
+        room = rooms.get(code)
+        if not room:
+            return
+        if room["host"] is ws:
+            print(f"[{code}] Host desconectado")
+            for cws in list(room["clients"].values()):
+                await tx(cws, {"ctrl": "host_disconnected"})
+                conns.pop(cws, None)
+            del rooms[code]
+        else:
+            room["clients"].pop(pid, None)
+            await tx(room["host"], {"ctrl": "peer_disconnected", "peer_id": pid})
+            print(f"[{code}] Cliente {pid} desconectado")
+        print(f"[-] {ws.remote_address}")
 
 
 async def main():
     port = int(os.environ.get("PORT", 8765))
-    print(f"[CardHub Relay] Escuchando en puerto {port}")
-    async with websockets.serve(handle_client, "0.0.0.0", port):
-        await asyncio.Future()  # correr para siempre
-
+    print(f"[CardHub Relay v5] Puerto {port}")
+    async with websockets.serve(handler, "0.0.0.0", port):
+        await asyncio.Future()
 
 if __name__ == "__main__":
     asyncio.run(main())
